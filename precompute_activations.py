@@ -8,7 +8,6 @@ import os
 from collections import defaultdict
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', type=str, default='meta-llama/Llama-3.1-8B-Instruct')
@@ -92,9 +91,6 @@ def main():
 
         # Get predicted tokens by taking argmax of logits
         predicted_tokens = torch.argmax(outputs.logits, dim=-1)
-        
-        # Convert tokens back to text
-        generated_text = tokenizer.batch_decode(predicted_tokens, skip_special_tokens=True)
 
         total_examples += len(batch['text'])
         if total_examples >= 100:
