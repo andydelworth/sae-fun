@@ -106,6 +106,7 @@ def train(model, local_rank):
             batch = tqdm_batch.to(torch.bfloat16).to(local_rank)
             reconstruction, sparse_representation = model(batch)
             mse_loss = torch.nn.functional.mse_loss(reconstruction, batch)
+            # TODO - make this a reparameterisation-invariant L1 penalty
             l1_loss = torch.nn.functional.l1_loss(sparse_representation, torch.zeros_like(sparse_representation))
             loss = mse_loss + args.l1_lambda * l1_loss
             loss.backward()
