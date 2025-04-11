@@ -104,7 +104,6 @@ def main():
             torch.save(torch.stack(hidden_states[args.layer_num], dim=0), f'{args.output}/layer_{args.layer_num}_batch_{global_batch}.pt')
             hidden_states = defaultdict(list)
         
-            breakpoint()
             result = subprocess.run(['du', '-sB1', args.output], capture_output=True, text=True)
             size_bytes = int(result.stdout.split()[0])
             if size_bytes >= 2.5 * 1024**4:
