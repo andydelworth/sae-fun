@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from tqdm import tqdm
 import argparse
 import torch
@@ -11,12 +13,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', type=str, default='meta-llama/Llama-3.1-8B-Instruct')
-parser.add_argument('--output', type=str, default='activations/')
+parser.add_argument('--output', type=str, default='activations_apr_10/')
 parser.add_argument('--batch-size', type=int, default=8)
-parser.add_argument('--dataset', type=str, default='monology/pile-uncopyrighted')
+parser.add_argument('--dataset', type=str, default='HuggingFaceFW/fineweb')
+parser.add_argument('--token_sample_pct', type=float, default=0.1)
+parser.add_argument('--layer_num', type=int, default=16)
+parser.add_argument('--save_every', type=int, default=10)
 args = parser.parse_args()
 
-layers_of_interest = [16, 24]
 os.makedirs(args.output, exist_ok=True)
 
 # Initialize distributed training
@@ -44,7 +48,8 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     
     # Load dataset
-    dataset = load_dataset(args.dataset, split="train", streaming=True)
+    print('Loading ', args.dataset)
+    dataset = load_dataset(args.dataset, split='train', streaming=True)
     
     # Process data in batches
     world_size = dist.get_world_size()
@@ -75,7 +80,7 @@ def main():
             truncation=True, 
             max_length=max_seq_length,
             return_tensors="pt"
-        ) # TODO - maybe we don't want to waste the rest of the seq
+        )
 
         input_ids = tokens['input_ids'].to(local_rank)
         attention_mask = tokens['attention_mask'].to(local_rank)
@@ -86,23 +91,25 @@ def main():
 
         batch_hidden_states = outputs.hidden_states
 
-        for layer in layers_of_interest:
-            hidden_states[layer].extend(batch_hidden_states[layer]) # note that first hidden state is just the embeddings
+        max_range = batch_hidden_states[args.layer_num].shape[0] * batch_hidden_states[args.layer_num].shape[1]
+        idcs = torch.randperm(max_range)[:int(max_range*args.token_sample_pct)]
+        # map the integer idcs back to 2d
+        batch_idx = idcs // batch_hidden_states[args.layer_num].shape[1]
+        token_idx = idcs % batch_hidden_states[args.layer_num].shape[1]
+        random_activation_set = batch_hidden_states[args.layer_num][batch_idx,token_idx,:].bfloat16()
+        hidden_states[args.layer_num].extend(random_activation_set) # note that first hidden state is just the embeddings
 
-        # Get predicted tokens by taking argmax of logits
-        predicted_tokens = torch.argmax(outputs.logits, dim=-1)
-
-        total_examples += len(batch['text'])
-        if total_examples >= 100:
-            for layer in layers_of_interest:
-                # Include rank in batch number to prevent overwrites
-                global_batch = (i // world_size) * world_size + local_rank
-                torch.save(torch.cat(hidden_states[layer], dim=0), f'{args.output}/layer_{layer}_batch_{global_batch}.pt')
+        if (i + 1) % args.save_every == 0:
+            global_batch = (i // args.save_every) * world_size + local_rank
+            torch.save(torch.stack(hidden_states[args.layer_num], dim=0), f'{args.output}/layer_{args.layer_num}_batch_{global_batch}.pt')
             hidden_states = defaultdict(list)
-            torch.cuda.empty_cache()  # Clear cache after saving
         
-        if total_examples >= 5000:
-            break
+            breakpoint()
+            result = subprocess.run(['du', '-sB1', args.output], capture_output=True, text=True)
+            size_bytes = int(result.stdout.split()[0])
+            if size_bytes >= 2.5 * 1024**4:
+                print(f"Directory too large: {size_bytes / 1024**4:.2f} TiB")
+                sys.exit(1)
 
 if __name__ == "__main__":
     main()
