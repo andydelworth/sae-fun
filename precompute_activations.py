@@ -60,7 +60,6 @@ def main():
     )
 
     hidden_states = defaultdict(list)
-    total_examples = 0
     max_seq_length = 512  # Limit sequence length to prevent OOM
 
     # Set random seeds for reproducibility
@@ -99,16 +98,15 @@ def main():
         random_activation_set = batch_hidden_states[args.layer_num][batch_idx,token_idx,:].bfloat16()
         hidden_states[args.layer_num].extend(random_activation_set) # note that first hidden state is just the embeddings
 
-        if (i + 1) % args.save_every == 0:
-            global_batch = (i // args.save_every) * world_size + local_rank
-            torch.save(torch.stack(hidden_states[args.layer_num], dim=0), f'{args.output}/layer_{args.layer_num}_batch_{global_batch}.pt')
+        if len(hidden_states[args.layer_num]) > 4000:
+            torch.save(torch.stack(hidden_states[args.layer_num], dim=0), f'{args.output}/layer_{args.layer_num}_batch_{i}.pt')
             hidden_states = defaultdict(list)
-        
             result = subprocess.run(['du', '-sB1', args.output], capture_output=True, text=True)
             size_bytes = int(result.stdout.split()[0])
             if size_bytes >= 2.5 * 1024**4:
                 print(f"Directory too large: {size_bytes / 1024**4:.2f} TiB")
                 sys.exit(1)
+            torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main()

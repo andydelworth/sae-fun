@@ -6,10 +6,16 @@ import random
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 
-activation_folder = '/persist/adelworth/sae-fun/activations'
+activation_folder = '/persist/adelworth/sae-fun/april_activations_v3'
 val_pct = 0.1
 chunk_size = 4096
 batch_size = chunk_size * 250
+
+def count_activations(fp):
+    try:
+        return len(torch.load(fp))
+    except Exception:
+        return 0
 
 def load_file(fp):
     try:
@@ -17,53 +23,49 @@ def load_file(fp):
         label = 'val' if random.random() < val_pct else 'train'
         return [(label, act.cpu().numpy()) for act in activations]
     except Exception:
-        return []  # silently skip corrupted files
+        return []
 
-# Get file list
+# Get relevant file paths
 file_paths = [os.path.join(root, f)
               for root, _, files in os.walk(activation_folder)
-              for f in files if 'layer_24' in f]
+              for f in files if 'layer_16' in f]
 
-train_buffer, val_buffer = [], []
-train_ctr, val_ctr = 0, 0
+# Count total activations
+print('counting activations!')
+with Pool(cpu_count()) as pool:
+    counts = [count_activations(fp) for fp in tqdm(file_paths, total=len(file_paths))]
 
+print('counts calculated!')
+total_activations = sum(counts)
+print(total_activations)
+n_val = int(total_activations * val_pct)
+n_train = total_activations - n_val
+n_val = int(n_val * 1.001)
+n_train = int(n_train * 1.001) # hacky way to protect against random sample lol
+
+# Allocate HDF5 datasets
+print('allocating dset!')
 with h5py.File("activations.h5", "w") as f:
-    train_set = f.create_dataset("train", shape=(0, 4096), maxshape=(None, 4096),
-                                 dtype='float32', chunks=(chunk_size, 4096))
-    val_set = f.create_dataset("validation", shape=(0, 4096), maxshape=(None, 4096),
-                               dtype='float32', chunks=(chunk_size, 4096))
+    train_set = f.create_dataset("train", shape=(n_train, 4096), dtype='float32',
+                                 chunks=(chunk_size, 4096))
+    val_set = f.create_dataset("validation", shape=(n_val, 4096), dtype='float32',
+                               chunks=(chunk_size, 4096))
 
+    train_ctr, val_ctr = 0, 0
+
+    print('creating pool!')
     with Pool(cpu_count()) as pool:
         for result in tqdm(pool.imap_unordered(load_file, file_paths), total=len(file_paths)):
             for label, activation in result:
                 if label == 'train':
-                    train_buffer.append(activation)
+                    train_set[train_ctr] = activation
+                    train_ctr += 1
                 else:
-                    val_buffer.append(activation)
+                    val_set[val_ctr] = activation
+                    val_ctr += 1
 
-            # write train
-            while len(train_buffer) >= batch_size:
-                batch = np.stack(train_buffer[:batch_size])
-                train_set.resize((train_ctr + batch_size, 4096))
-                train_set[train_ctr:train_ctr + batch_size] = batch
-                train_ctr += batch_size
-                train_buffer = train_buffer[batch_size:]
-
-            # write val
-            while len(val_buffer) >= batch_size:
-                batch = np.stack(val_buffer[:batch_size])
-                val_set.resize((val_ctr + batch_size, 4096))
-                val_set[val_ctr:val_ctr + batch_size] = batch
-                val_ctr += batch_size
-                val_buffer = val_buffer[batch_size:]
-
-    # write remaining
-    if train_buffer:
-        batch = np.stack(train_buffer)
-        train_set.resize((train_ctr + batch.shape[0], 4096))
-        train_set[train_ctr:train_ctr + batch.shape[0]] = batch
-
-    if val_buffer:
-        batch = np.stack(val_buffer)
-        val_set.resize((val_ctr + batch.shape[0], 4096))
-        val_set[val_ctr:val_ctr + batch.shape[0]] = batch
+    # Resize down if we overestimated due to randomness
+    if train_ctr < n_train:
+        train_set.resize((train_ctr, 4096))
+    if val_ctr < n_val:
+        val_set.resize((val_ctr, 4096))
