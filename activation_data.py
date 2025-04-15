@@ -61,9 +61,9 @@ class HDF5ActivationDataset(Dataset):
 
 def get_data_loaders(activation_dir, layer_num, batch_size=40, num_workers=4, dist=False):
     # train_set = ActivationDataset(activation_dir, layer_num, train=True)
-    train_set = ActivationDataset(activation_dir, layer_num, train=False)
+    # train_set = ActivationDataset(activation_dir, layer_num, train=False)
     # train_set = HDF5ActivationDataset(activation_dir, split='train')
-    # validation_set = HDF5ActivationDataset(activation_dir, split='validation')
+    validation_set = HDF5ActivationDataset(activation_dir, split='validation')
 
     if dist:
         train_sampler = DistributedSampler(train_set, shuffle=True)
