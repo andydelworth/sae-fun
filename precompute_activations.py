@@ -9,7 +9,10 @@ from datasets import load_dataset
 import os
 from collections import defaultdict
 import torch.distributed as dist
+import h5py
+import numpy as np
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', type=str, default='meta-llama/Llama-3.1-8B-Instruct')
@@ -19,6 +22,7 @@ parser.add_argument('--dataset', type=str, default='HuggingFaceFW/fineweb')
 parser.add_argument('--token_sample_pct', type=float, default=0.1)
 parser.add_argument('--layer_num', type=int, default=16)
 parser.add_argument('--save_every', type=int, default=10)
+parser.add_argument('--output_h5', type=str, default='token_activations.h5')
 args = parser.parse_args()
 
 os.makedirs(args.output, exist_ok=True)
@@ -49,18 +53,27 @@ def main():
     
     # Load dataset
     print('Loading ', args.dataset)
-    dataset = load_dataset(args.dataset, split='train', streaming=True)
+    dataset = load_dataset(
+        args.dataset,
+        split='train',
+        streaming=True,
+        trust_remote_code=True  # FineWeb requires this
+    )
     
     # Process data in batches
     world_size = dist.get_world_size()
     dataloader = DataLoader(
         dataset, 
         batch_size=args.batch_size,
-        shuffle=False  # No shuffling for streaming
+        shuffle=False,  # No shuffling for streaming
+        num_workers=0,  # Must be 0 for streaming
+        pin_memory=True  # Can help with GPU transfer
     )
 
     hidden_states = defaultdict(list)
     max_seq_length = 512  # Limit sequence length to prevent OOM
+    max_tokens = 330_000_000  # 330 million tokens
+    token_dim = 4096  # Assuming 4096-dimensional token embeddings
 
     # Set random seeds for reproducibility
     torch.manual_seed(5)
@@ -68,6 +81,18 @@ def main():
     import random
     random.seed(5)
 
+    # create HDF5 dataset
+    if local_rank == 0:
+        h5_file = h5py.File(args.output_h5, 'w')
+        activations_dataset = h5_file.create_dataset(
+            'activations',
+            shape=(max_tokens, token_dim),
+            dtype=np.float16,
+            chunks=(1000, token_dim)  # Chunk size for efficient I/O
+        )
+        token_counter = 0
+
+    # Use a simple round-robin distribution for streaming
     for i, batch in tqdm(enumerate(dataloader)):
         # Skip examples based on rank to distribute data
         if i % world_size != local_rank:
@@ -99,14 +124,36 @@ def main():
         hidden_states[args.layer_num].extend(random_activation_set) # note that first hidden state is just the embeddings
 
         if len(hidden_states[args.layer_num]) > 4000:
-            torch.save(torch.stack(hidden_states[args.layer_num], dim=0), f'{args.output}/layer_{args.layer_num}_batch_{i}.pt')
+            # Gather activations from all ranks
+            local_acts = torch.stack(hidden_states[args.layer_num], dim=0)
+            gathered_acts = [torch.zeros_like(local_acts) for _ in range(world_size)]
+            dist.all_gather(gathered_acts, local_acts)
+            
+            # Process only on rank 0
+            if local_rank == 0:
+                # Flatten and save all gathered activations
+                all_acts = torch.cat(gathered_acts, dim=0)
+                num_new_tokens = all_acts.shape[0]
+                
+                if token_counter + num_new_tokens > max_tokens:
+                    print(f"Reached maximum token limit of {max_tokens}")
+                    print(f"Current token counter: {token_counter}")
+                    print("Closing HDF5 file...")
+                    h5_file.close()
+                    sys.exit(1)
+                
+                # Convert BFloat16 to float16 before saving to HDF5
+                activations_dataset[token_counter:token_counter + num_new_tokens] = all_acts.cpu().to(torch.float16).numpy()
+                token_counter += num_new_tokens
+                
+                if token_counter % 1000000 == 0:  # Print progress every 1M tokens
+                    print(f"Processed {token_counter} tokens")
+            
             hidden_states = defaultdict(list)
-            result = subprocess.run(['du', '-sB1', args.output], capture_output=True, text=True)
-            size_bytes = int(result.stdout.split()[0])
-            if size_bytes >= 2.5 * 1024**4:
-                print(f"Directory too large: {size_bytes / 1024**4:.2f} TiB")
-                sys.exit(1)
             torch.cuda.empty_cache()
+
+    if local_rank == 0:
+        h5_file.close()
 
 if __name__ == "__main__":
     main()
