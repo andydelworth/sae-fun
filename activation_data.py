@@ -59,23 +59,21 @@ class HDF5ActivationDataset(Dataset):
             tensor = torch.tensor(f[self.split][index])  # Load tensor lazily
         return tensor
 
-def get_data_loaders(activation_dir, layer_num, batch_size=40, num_workers=4, dist=False):
-    # train_set = ActivationDataset(activation_dir, layer_num, train=True)
-    # train_set = ActivationDataset(activation_dir, layer_num, train=False)
-    # train_set = HDF5ActivationDataset(activation_dir, split='train')
-    validation_set = HDF5ActivationDataset(activation_dir, split='validation')
+def get_data_loaders(activation_fp, layer_num, batch_size=40, num_workers=4, dist=False):
+    train_set = HDF5ActivationDataset(activation_fp, split='activations')
+    validation_set = HDF5ActivationDataset(activation_fp, split='activations')
 
     if dist:
         train_sampler = DistributedSampler(train_set, shuffle=True)
-        # validation_sampler = DistributedSampler(validation_set, shuffle=False)
+        validation_sampler = DistributedSampler(validation_set, shuffle=False)
     else:
         train_sampler = None
-        # validation_sampler = None
+        validation_sampler = None
 
     train_loader = DataLoader(train_set, batch_size, num_workers=num_workers, sampler=train_sampler, prefetch_factor=4, pin_memory=True)
-    # validation_loader = DataLoader(validation_set, batch_size, num_workers=num_workers, sampler=validation_sampler, prefetch_factor=4, pin_memory=True)
+    validation_loader = DataLoader(validation_set, batch_size, num_workers=num_workers, sampler=validation_sampler, prefetch_factor=4, pin_memory=True)
 
-    return train_loader, None
+    return train_loader, validation_loader
 
 if __name__ == "__main__":
     import time
@@ -86,7 +84,7 @@ if __name__ == "__main__":
     import torch
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--activation_dir', type=str, default='april_activations_v3')
+    parser.add_argument('--activation_fp', type=str, default='token_activations_500m.h5')
     parser.add_argument('--batch_size', type=int, default=40)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--layer_num', type=int, default=16)
@@ -97,7 +95,7 @@ if __name__ == "__main__":
     local_rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(local_rank)
 
-    train_loader, validation_loader = get_data_loaders(args.activation_dir, args.layer_num, args.batch_size, args.num_workers, dist=True)
+    train_loader, validation_loader = get_data_loaders(args.activation_fp, args.layer_num, args.batch_size, args.num_workers, dist=True)
 
     if local_rank == 0:
         print("\nTiming train loader...")
