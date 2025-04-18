@@ -11,6 +11,7 @@ class SAE(nn.Module):
         self.decoder = torch.nn.Sequential(
             torch.nn.Linear(hidden_dim, input_dim),
         )
+        self.hidden_dim = hidden_dim
         self.l1_lambda = l1_lambda
     
     def forward(self, x):

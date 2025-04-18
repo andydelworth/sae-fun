@@ -36,32 +36,47 @@ class ActivationDataset(Dataset):
         return max(self.idx_map.keys()) + 1
 
 class HDF5ActivationDataset(Dataset):
-    def __init__(self, hdf5_file, split="train"):
+    def __init__(self, hdf5_file, split="train", val_pct = 0.002): # 1m val examples
         """
         PyTorch Dataset for HDF5 storage.
         
         Args:
             hdf5_file (str): Path to the HDF5 file.
-            split (str): Dataset split, "train" or "test".
+            split (str): Dataset split, "train" or "val".
+            val_pct (float): Percentage of data to use for validation.
         """
         self.hdf5_file = hdf5_file
         self.split = split
+        self.val_pct = val_pct
 
         # Open file to get dataset size
         with h5py.File(self.hdf5_file, "r") as f:
-            self.length = len(f[self.split])
+            total_length = len(f['activations'])
+            self.val_size = int(total_length * self.val_pct)
+            self.train_size = total_length - self.val_size
+            
+            if self.split == "train":
+                self.length = self.train_size
+                self.start_idx = 0
+            elif self.split == "val":
+                self.length = self.val_size
+                self.start_idx = self.train_size
+            else:
+                raise ValueError(f"Invalid split: {self.split}")
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, index):
         with h5py.File(self.hdf5_file, "r") as f:
-            tensor = torch.tensor(f[self.split][index])  # Load tensor lazily
+            # Adjust index based on split
+            actual_index = self.start_idx + index
+            tensor = torch.tensor(f['activations'][actual_index])
         return tensor
 
 def get_data_loaders(activation_fp, layer_num, batch_size=40, num_workers=4, dist=False):
-    train_set = HDF5ActivationDataset(activation_fp, split='activations')
-    validation_set = HDF5ActivationDataset(activation_fp, split='activations')
+    train_set = HDF5ActivationDataset(activation_fp, split='train')
+    validation_set = HDF5ActivationDataset(activation_fp, split='val')
 
     if dist:
         train_sampler = DistributedSampler(train_set, shuffle=True)
