@@ -1,3 +1,4 @@
+import math
 from tqdm import tqdm
 import argparse
 import torch
@@ -17,9 +18,10 @@ parser.add_argument('--num_epochs', type=int, default=10)
 parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--activation_file', type=str, default='/persist/adelworth/sae-fun/token_activations_500m.h5')
 parser.add_argument('--hidden_dim_multiplier', type=int, default=64)
-parser.add_argument('--l1_lambda', type=float, default=5.0)
-parser.add_argument('--save_every_n_steps', type=int, default=25000)
+parser.add_argument('--l1_lambda', type=float, default=1e-4)
+parser.add_argument('--save_every_n_steps', type=int, default=1000000)
 parser.add_argument('--validate_every_n_steps', type=int, default=25000)
+parser.add_argument('--grad_clip_norm', type=float, default=1.0)
 args = parser.parse_args()
 
 # Initialize distributed training
@@ -57,7 +59,9 @@ def validate(model, validation_loader, local_rank, writer, step_num):
             
             # Mean across features, sum across batch
             mse_loss = torch.nn.functional.mse_loss(reconstruction, batch, reduction='none').mean(dim=1).sum()
-            l1_loss = torch.nn.functional.l1_loss(sparse_representation, torch.zeros_like(sparse_representation), reduction='none').mean(dim=1).sum()
+            # reparam invariant l1 loss
+            decoder_column_norms = torch.norm(model.module.decoder[0].weight, dim=0) * sparse_representation
+            decoder_invariant_l1_loss = torch.sum(decoder_column_norms * sparse_representation)
 
             # For L0, count average number of non-zeros per sample
             l0_loss = (sparse_representation != 0).float().mean(dim=1).sum()
@@ -69,7 +73,7 @@ def validate(model, validation_loader, local_rank, writer, step_num):
                     active_features.index_fill_(0, active_indices[:, 1].unique(), True)
             
             val_mse_loss += mse_loss
-            val_l1_loss += l1_loss
+            val_l1_loss += decoder_invariant_l1_loss
             val_l0_loss += l0_loss
             total_samples += batch_size
     
@@ -102,6 +106,13 @@ def validate(model, validation_loader, local_rank, writer, step_num):
         writer.add_scalar('Stats/active_feature_percentage', 100 * (hidden_dim - dead_feature_count) / hidden_dim, step_num)
     
     return avg_val_mse, avg_val_l1
+
+'''
+TODO:
+- add pre-encoder bias
+- neuron resampling
+- add normalization of activations?
+'''
 
 def train(model, local_rank):
     train_loader, validation_loader = get_data_loaders(args.activation_file, args.layer_num, batch_size=128)
@@ -145,18 +156,17 @@ def train(model, local_rank):
             reconstruction, sparse_representation = model(batch)
             mse_loss = torch.nn.functional.mse_loss(reconstruction, batch)
             # TODO - make this a reparameterisation-invariant L1 penalty
-            l1_loss = torch.nn.functional.l1_loss(sparse_representation, torch.zeros_like(sparse_representation))
-            loss = mse_loss + args.l1_lambda * l1_loss
+            decoder_column_norms = torch.norm(model.module.decoder[0].weight, dim=0) * sparse_representation
+            decoder_invariant_l1_loss = torch.sum(decoder_column_norms * sparse_representation)
+            loss = mse_loss + args.l1_lambda * decoder_invariant_l1_loss
             loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
             
             # Increment global step counter
             global_step += 1
             
             # Accumulate step-level losses
             step_mse_loss += mse_loss.item()
-            step_l1_loss += l1_loss.item()
+            step_l1_loss += decoder_invariant_l1_loss.item()
             step_count += 1
             
             # Log every 100 steps
@@ -177,8 +187,8 @@ def train(model, local_rank):
                 total_weight_norm = 0
                 total_grad_norm = 0
 
-                weight_norm = torch.sqrt(torch.sum([w ** 2 for w in model.parameters()]))
-                grad_norm = torch.sqrt(torch.sum([w.grad ** 2 for w in model.parameters()]))
+                weight_norm = math.sqrt(sum(torch.sum(w ** 2).item() for w in model.parameters() if w.grad is not None)) # doesnt do mean/var norms i think? unclear
+                grad_norm = math.sqrt(sum(torch.sum(w.grad ** 2).item() for w in model.parameters() if w.grad is not None))
                 
                 # Log metrics only on main process
                 if local_rank == 0:
@@ -228,10 +238,19 @@ def train(model, local_rank):
                 }
                 torch.save(checkpoint, f'{run_dir}/checkpoint_step_{global_step}.pt')
                 print(f'Checkpoint saved at step {global_step}')
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+
+            if (step + 1) % 100 == 0 and local_rank == 0:
+                clipped_grad_norm = math.sqrt(sum(torch.sum(w.grad ** 2).item() for w in model.parameters() if w.grad is not None))
+                writer.add_scalar('Parameters/clipped_grad_norm', clipped_grad_norm, global_step)
+
+            optimizer.step()
+            optimizer.zero_grad()
             
             # Accumulate epoch-level losses
             train_mse_loss += mse_loss.item()
-            train_l1_loss += l1_loss.item()
+            train_l1_loss += decoder_invariant_l1_loss.item()
             num_batches += 1
         
         # Gather metrics across all processes
