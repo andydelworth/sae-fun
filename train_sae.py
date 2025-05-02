@@ -105,7 +105,40 @@ def validate(model, validation_loader, local_rank, writer, step_num):
         writer.add_scalar('Stats/val_dead_feature_count', dead_feature_count, step_num)
         writer.add_scalar('Stats/active_feature_percentage', 100 * (hidden_dim - dead_feature_count) / hidden_dim, step_num)
     
+    if args.resample_dead and step_num > 0:
+        resample_dead_features(model, active_features, local_rank)
+
     return avg_val_mse, avg_val_l1
+
+def resample_dead_features(model, active_features, local_rank):
+    if local_rank != 0:
+        return
+
+    with torch.no_grad():
+        # encoder: Linear(input_dim, hidden_dim)
+        encoder = model.module.encoder[0]
+        decoder = model.module.decoder[0]
+        input_dim = encoder.weight.shape[1]
+        hidden_dim = encoder.weight.shape[0]
+
+        dead_indices = (~active_features).nonzero(as_tuple=False).flatten()
+        for i in dead_indices:
+            # Resample encoder rows as random interpolations of existing latents
+            # This probably isn't ideal. Could be better to init as high-MSE token latents.
+            new_latent = torch.mean(torch.randint(low=0, high=hidden_dim, size=(5)))
+            encoder.weight[i] = new_latent
+            if encoder.bias is not None:
+                bound = 1 / math.sqrt(input_dim)
+                encoder.bias[i].uniform_(-bound, bound)
+
+            # Set decoder column i = encoder row i^T
+            decoder.weight[:, i] = encoder.weight[i].detach().clone()
+
+    # Sync updated weights from rank 0 to all others
+    for p in model.module.encoder.parameters():
+        dist.broadcast(p.data, src=0)
+    for p in model.module.decoder.parameters():
+        dist.broadcast(p.data, src=0)
 
 '''
 TODO:

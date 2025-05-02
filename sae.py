@@ -28,7 +28,3 @@ class SAE(nn.Module):
         sparse_representation = self.encoder(x - self.decoder[0].bias)
         reconstruction = self.decoder(sparse_representation)
         return reconstruction, sparse_representation
-    
-
-
-sae = SAE(64, 4096)
