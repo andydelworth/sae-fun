@@ -1,6 +1,7 @@
 from tqdm import tqdm
 import os
 import torch
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import h5py
@@ -63,6 +64,15 @@ class HDF5ActivationDataset(Dataset):
                 self.start_idx = self.train_size
             else:
                 raise ValueError(f"Invalid split: {self.split}")
+        
+        self.precompute_statistics()
+
+    def precompute_statistics(self):
+        with h5py.File(self.hdf5_file, "r") as f:
+            activations = f['activations']
+            random_idcs = np.random.choice(activations.shape[0], size=10000, replace=False)
+            random_idcs.sort()
+            self.dimwise_mean = np.mean(activations[random_idcs, :], axis=0)
 
     def __len__(self):
         return self.length
@@ -72,6 +82,8 @@ class HDF5ActivationDataset(Dataset):
             # Adjust index based on split
             actual_index = self.start_idx + index
             tensor = torch.tensor(f['activations'][actual_index])
+            tensor = tensor - self.dimwise_mean
+            tensor = tensor / torch.norm(tensor, dim=0)
         return tensor
 
 def get_data_loaders(activation_fp, layer_num, batch_size=40, num_workers=4, dist=False):

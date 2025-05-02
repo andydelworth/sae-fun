@@ -15,7 +15,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--output_dir', type=str, default='sae_out/')
 parser.add_argument('--layer_num', type=int, default=16)
 parser.add_argument('--num_epochs', type=int, default=10)
-parser.add_argument('--lr', type=float, default=1e-3)
+parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--activation_file', type=str, default='/persist/adelworth/sae-fun/token_activations_500m.h5')
 parser.add_argument('--hidden_dim_multiplier', type=int, default=64)
 parser.add_argument('--l1_lambda', type=float, default=1e-4)
@@ -115,7 +115,7 @@ TODO:
 '''
 
 def train(model, local_rank):
-    train_loader, validation_loader = get_data_loaders(args.activation_file, args.layer_num, batch_size=128)
+    train_loader, validation_loader = get_data_loaders(args.activation_file, args.layer_num, batch_size=192)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     print(f'Starting training on device {local_rank}...')
@@ -203,7 +203,7 @@ def train(model, local_rank):
                     writer.add_scalar('Parameters/grad_norm', grad_norm, global_step)
                     
                     # Activation statistics
-                    writer.add_histogram('Activations/sparse_representation', sparse_representation.flatten(), global_step)
+                    # writer.add_histogram('Activations/sparse_representation', sparse_representation.flatten(), global_step)
                     writer.add_scalar('Activations/sparsity', (sparse_representation.abs() < 1e-6).float().mean(), global_step)
                     writer.add_scalar('Activations/max_activation', sparse_representation.abs().max(), global_step)
                 
