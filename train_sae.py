@@ -19,9 +19,10 @@ parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--activation_file', type=str, default='/persist/adelworth/sae-fun/token_activations_500m.h5')
 parser.add_argument('--hidden_dim_multiplier', type=int, default=64)
 parser.add_argument('--l1_lambda', type=float, default=1e-4)
-parser.add_argument('--save_every_n_steps', type=int, default=1000000)
+parser.add_argument('--save_every_n_steps', type=int, default=25000)
 parser.add_argument('--validate_every_n_steps', type=int, default=25000)
 parser.add_argument('--grad_clip_norm', type=float, default=1.0)
+parser.add_argument('--resample_dead', default=False, action='store_true')
 args = parser.parse_args()
 
 # Initialize distributed training
@@ -148,7 +149,7 @@ TODO:
 '''
 
 def train(model, local_rank):
-    train_loader, validation_loader = get_data_loaders(args.activation_file, args.layer_num, batch_size=192)
+    train_loader, validation_loader = get_data_loaders(args.activation_file, args.layer_num, batch_size=128)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     print(f'Starting training on device {local_rank}...')
@@ -220,8 +221,12 @@ def train(model, local_rank):
                 total_weight_norm = 0
                 total_grad_norm = 0
 
+                encoder_norm = math.sqrt(torch.sum(model.encoder ** 2).item())
+                decoder_norm = math.sqrt(torch.sum(model.decoc=der ** 2).item())
                 weight_norm = math.sqrt(sum(torch.sum(w ** 2).item() for w in model.parameters() if w.grad is not None)) # doesnt do mean/var norms i think? unclear
                 grad_norm = math.sqrt(sum(torch.sum(w.grad ** 2).item() for w in model.parameters() if w.grad is not None))
+                encoder_grad_norm = math.sqrt(torch.sum(model.encoder.grad ** 2).item())
+                decoder_grad_norm = math.sqrt(torch.sum(model.decoder.grad ** 2).item())
                 
                 # Log metrics only on main process
                 if local_rank == 0:
@@ -234,6 +239,10 @@ def train(model, local_rank):
                     # Parameter statistics
                     writer.add_scalar('Parameters/weight_norm', weight_norm, global_step)
                     writer.add_scalar('Parameters/grad_norm', grad_norm, global_step)
+                    writer.add_scalar('Parameters/encoder_norm', encoder_norm, global_step)
+                    writer.add_scalar('Parameters/decoder_norm', decoder_norm, global_step)
+                    writer.add_scalar('Parameters/encoder_grad_norm', encoder_grad_norm, global_step)
+                    writer.add_scalar('Parameters/decoder_grad_norm', decoder_grad_norm, global_step)
                     
                     # Activation statistics
                     # writer.add_histogram('Activations/sparse_representation', sparse_representation.flatten(), global_step)
