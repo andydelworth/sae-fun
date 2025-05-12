@@ -6,10 +6,12 @@ from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import os
-from sae import SAE
+from sae import SAE, BatchTopKSAE
 from activation_data import get_data_loaders
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
+from torchviz import make_dot
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--output_dir', type=str, default='sae_out/')
@@ -23,6 +25,7 @@ parser.add_argument('--save_every_n_steps', type=int, default=25000)
 parser.add_argument('--validate_every_n_steps', type=int, default=25000)
 parser.add_argument('--grad_clip_norm', type=float, default=1.0)
 parser.add_argument('--resample_dead', default=False, action='store_true')
+parser.add_argument('--sae_type', type=str, default='relu')
 args = parser.parse_args()
 
 # Initialize distributed training
@@ -34,7 +37,10 @@ def setup_ddp():
 
 # Load model and move to GPU
 def load_model(local_rank):
-    model = SAE(input_dim=4096, hidden_dim=4096 * args.hidden_dim_multiplier).to(torch.float32)
+    if args.sae_type == 'relu':
+        model = SAE(input_dim=4096, hidden_dim=4096 * args.hidden_dim_multiplier).to(torch.float32)
+    elif args.sae_type == 'batch_top_k':
+        model = BatchTopKSAE(input_dim=4096, hidden_dim=4096 * args.hidden_dim_multiplier, k=16).to(torch.float32)
     model = model.to(local_rank)
     model = DDP(model, device_ids=[local_rank])
     if local_rank == 0:
@@ -186,13 +192,23 @@ def train(model, local_rank):
         step_count = torch.tensor(0, device=local_rank)
         
         for step, tqdm_batch in enumerate(tqdm(train_loader, desc=f'Train Epoch {epoch_num}', disable=local_rank != 0)):
+
+            if step % 1000 == 0 and local_rank == 0:
+                print(torch.cuda.memory_summary())
+
+            if step == 100 and local_rank == 0:
+                make_dot(loss, params=dict(model.named_parameters())).render("loss_graph", format="pdf")
+                print("Graph saved to loss_graph.pdf")
+            
             batch = tqdm_batch.to(torch.float32).to(local_rank)
             reconstruction, sparse_representation = model(batch)
             mse_loss = torch.nn.functional.mse_loss(reconstruction, batch)
             # TODO - make this a reparameterisation-invariant L1 penalty
             decoder_column_norms = torch.norm(model.module.decoder[0].weight, dim=0) * sparse_representation
             decoder_invariant_l1_loss = torch.sum(decoder_column_norms * sparse_representation)
-            loss = mse_loss + args.l1_lambda * decoder_invariant_l1_loss
+            loss = mse_loss
+            if args.sae_type == 'relu':
+                loss = loss + args.l1_lambda * decoder_invariant_l1_loss
             loss.backward()
             
             # Increment global step counter
@@ -221,12 +237,12 @@ def train(model, local_rank):
                 total_weight_norm = 0
                 total_grad_norm = 0
 
-                encoder_norm = math.sqrt(torch.sum(model.encoder ** 2).item())
-                decoder_norm = math.sqrt(torch.sum(model.decoc=der ** 2).item())
+                encoder_norm = math.sqrt(torch.sum(model.module.encoder[0].weight ** 2).item())
+                decoder_norm = math.sqrt(torch.sum(model.module.decoder[0].weight ** 2).item())
                 weight_norm = math.sqrt(sum(torch.sum(w ** 2).item() for w in model.parameters() if w.grad is not None)) # doesnt do mean/var norms i think? unclear
                 grad_norm = math.sqrt(sum(torch.sum(w.grad ** 2).item() for w in model.parameters() if w.grad is not None))
-                encoder_grad_norm = math.sqrt(torch.sum(model.encoder.grad ** 2).item())
-                decoder_grad_norm = math.sqrt(torch.sum(model.decoder.grad ** 2).item())
+                encoder_grad_norm = math.sqrt(torch.sum(model.module.encoder[0].weight.grad ** 2).item())
+                decoder_grad_norm = math.sqrt(torch.sum(model.module.decoder[0].weight.grad ** 2).item())
                 
                 # Log metrics only on main process
                 if local_rank == 0:
