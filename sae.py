@@ -53,14 +53,14 @@ class BatchTopKSAE(nn.Module):
     def forward(self, x):
         hidden_state = self.encoder(x - self.decoder[0].bias) # BS, HD
         top_k_acts = torch.topk(hidden_state, self.k * x.shape[0])
-        if self.training:
-            self.update_min_act_value(torch.min(top_k_acts.values))
+        # if self.training:
+        #     self.update_min_act_value(torch.min(top_k_acts.values))
         sparse_representation = torch.zeros_like(hidden_state).scatter(-1, top_k_acts.indices, top_k_acts.values)
         reconstruction = self.decoder(sparse_representation)
         return reconstruction, sparse_representation
     
     def update_min_act_value(self, new_val):
-        if self. min_activation_value is None:
+        if self.min_activation_value is None:
             self.min_activation_value = new_val
         else:
             self.min_activation_value = self.min_activation_value * self.alpha + (1 - self.alpha) * new_val

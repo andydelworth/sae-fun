@@ -14,8 +14,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from queue import Queue
 from threading import Thread
 
-save_queue = Queue(maxsize=256)  # blocks if too much backlog
-executor = ThreadPoolExecutor(max_workers=2)
+save_queue = Queue(maxsize=64)  # blocks if too much backlog
+executor = ThreadPoolExecutor(max_workers=16)
 SAE_DEVICE = 'cuda:1'
 
 # Initialize distributed training
@@ -127,6 +127,8 @@ def main():
         input_ids = result['input_ids']
         sae_activations = sae_activations * (sae_activations > 0.1) # mask out small activations
         sae_activations = sae_activations.to(torch.float16)
+        # ok - let's drop the last 15/16 of features. just to save sapce.
+        sae_activations = sae_activations[:,:sae_activations.shape[1] // 16]
 
         '''
         question - is it valid to store only the last token representation of the text?
@@ -167,10 +169,10 @@ thread.start()
 def save_things(sparsified, regular, ids, text, output_dir, global_idx):
     os.makedirs(output_dir, exist_ok=True)
 
-    with open(os.path.join(output_dir, f"{local_rank}_{global_idx}.txt"), 'w') as f:
+    with open(os.path.join(output_dir, f"{global_idx}.txt"), 'w') as f:
         f.write(text)
     torch.save(sparsified.cpu(), os.path.join(output_dir, f"{global_idx}_sparse.pt"))
-    torch.save(regular.cpu(), os.path.join(output_dir, f"{global_idx}.pt"))
+    # torch.save(regular.cpu(), os.path.join(output_dir, f"{global_idx}.pt"))
     torch.save(ids.cpu(), os.path.join(output_dir, f"{global_idx}_ids.pt"))
 
 
