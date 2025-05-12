@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+import shutil
+import pickle
 from tqdm import tqdm
 import transformers
 import datasets
@@ -8,8 +11,11 @@ from torch.utils.data import DataLoader
 import os
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from queue import Queue
+from threading import Thread
 
-
+save_queue = Queue(maxsize=256)  # blocks if too much backlog
+executor = ThreadPoolExecutor(max_workers=2)
 SAE_DEVICE = 'cuda:1'
 
 # Initialize distributed training
@@ -62,9 +68,14 @@ def get_sae_activations(text, sae, lm, tokenizer, max_seq_length, local_rank):
     batch_hidden_states = outputs.hidden_states[16].to(SAE_DEVICE) # 16th layer
 
     # use those as input to the sae
-    sae_activations = sae(batch_hidden_states)
+    with torch.cuda.amp.autocast():
+        with torch.no_grad():
+            sae_activations = sae(batch_hidden_states)
 
-    return sae_activations
+    return {
+        'sae_activations': sae_activations,
+        'input_ids': input_ids
+    }
 
 
 
@@ -100,13 +111,22 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     for i, row in tqdm(enumerate(dataloader)):
-        if i >= args.max_iters:
+        # if i >= args.max_iters:
+        #     break
+
+        # let's put a disk space limit on here
+        total, used, free = shutil.disk_usage("/persist/adelworth")
+        if (free / 1024**3) < 50:
+            # < 50 gb free; kill it
             break
 
         text = row['text']
         # breakpoint()
-        sae_activations, token_reconstruction = get_sae_activations(text, sae, lm, tokenizer, 512, local_rank)
+        result = get_sae_activations(text, sae, lm, tokenizer, 512, local_rank)
+        token_reconstruction, sae_activations = result['sae_activations'][0], result['sae_activations'][1]
+        input_ids = result['input_ids']
         sae_activations = sae_activations * (sae_activations > 0.1) # mask out small activations
+        sae_activations = sae_activations.to(torch.float16)
 
         '''
         question - is it valid to store only the last token representation of the text?
@@ -122,15 +142,36 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
 
         for batch_idx in range(sae_activations.shape[0]):
-            with open(os.path.join(args.output_dir, str(args.batch_size * i + batch_idx) + '.txt'), 'w') as f:
-                f.write(text[batch_idx])
+            sparsified_activation = sae_activations[batch_idx].to_sparse()
+            save_queue.put((sparsified_activation, sae_activations[batch_idx], input_ids[batch_idx], text[batch_idx], args.output_dir, str(args.batch_size * i + batch_idx)))
+            # we're currently saving all 512 tokens. we may or may not want to do that - is last token sufficient? let's do all fo rnow.
+            # TODO - call save function
+    save_queue.put(None)
+    thread.join()
+    executor.shutdown()
+
         
-            # TODO - do we want to zero-out the small activations, and use sparse representation to save space?
-            sparsified_activation = sparse_activations[batch_idx].to_sparse()
-            torch.save(sparsified_activation, os.path.join(args.output_dir, str(args.batch_size * i + batch_idx) + '.pt'))
-                
+
+def save_worker():
+    while True:
+        item = save_queue.get()
+        if item is None:
+            break
+        executor.submit(save_things, *item)
+        save_queue.task_done()
+
+thread = Thread(target=save_worker)
+thread.start()
 
 
+def save_things(sparsified, regular, ids, text, output_dir, global_idx):
+    os.makedirs(output_dir, exist_ok=True)
+
+    with open(os.path.join(output_dir, f"{local_rank}_{global_idx}.txt"), 'w') as f:
+        f.write(text)
+    torch.save(sparsified.cpu(), os.path.join(output_dir, f"{global_idx}_sparse.pt"))
+    torch.save(regular.cpu(), os.path.join(output_dir, f"{global_idx}.pt"))
+    torch.save(ids.cpu(), os.path.join(output_dir, f"{global_idx}_ids.pt"))
 
 
 if __name__ == '__main__':

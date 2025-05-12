@@ -1,3 +1,4 @@
+import gc
 import math
 from tqdm import tqdm
 import argparse
@@ -26,6 +27,7 @@ parser.add_argument('--validate_every_n_steps', type=int, default=25000)
 parser.add_argument('--grad_clip_norm', type=float, default=1.0)
 parser.add_argument('--resample_dead', default=False, action='store_true')
 parser.add_argument('--sae_type', type=str, default='relu')
+parser.add_argument('--init_val', action='store_true', default=False)
 args = parser.parse_args()
 
 # Initialize distributed training
@@ -170,12 +172,13 @@ def train(model, local_rank):
         writer = None
         run_dir = None
 
-    # Run initial validation
-    avg_val_mse, avg_val_l1 = validate(model, validation_loader, local_rank, writer, 0)
-    
-    # Print initial validation summary only on main process
-    if local_rank == 0:
-        print(f'Initial validation: Val MSE: {avg_val_mse:.4f}, Val L1: {avg_val_l1:.4f}')
+    if args.init_val:
+        # Run initial validation
+        avg_val_mse, avg_val_l1 = validate(model, validation_loader, local_rank, writer, 0)
+        
+        # Print initial validation summary only on main process
+        if local_rank == 0:
+            print(f'Initial validation: Val MSE: {avg_val_mse:.4f}, Val L1: {avg_val_l1:.4f}')
     
     global_step = 0
     
@@ -193,15 +196,21 @@ def train(model, local_rank):
         
         for step, tqdm_batch in enumerate(tqdm(train_loader, desc=f'Train Epoch {epoch_num}', disable=local_rank != 0)):
 
-            if step % 1000 == 0 and local_rank == 0:
-                print(torch.cuda.memory_summary())
-
-            if step == 100 and local_rank == 0:
-                make_dot(loss, params=dict(model.named_parameters())).render("loss_graph", format="pdf")
-                print("Graph saved to loss_graph.pdf")
+            # if step == 100 and local_rank == 0:
+            #     make_dot(loss, params=dict(model.named_parameters())).render("loss_graph", format="pdf")
+            #     print("Graph saved to loss_graph.pdf")
             
             batch = tqdm_batch.to(torch.float32).to(local_rank)
             reconstruction, sparse_representation = model(batch)
+
+            if (step + 1) % 1000 == 0 and local_rank == 0:
+                print(torch.cuda.memory_summary())
+                print('TENSOR COUNTS:')
+                print(len([obj for obj in gc.get_objects() if torch.is_tensor(obj)]))
+                # print('Retained Graph Refs:')
+                # print([t for t in gc.get_objects().shape if torch.is_tensor(t) and t.grad_fn is not None])
+                print(sparse_representation.shape, sparse_representation.requires_grad)
+
             mse_loss = torch.nn.functional.mse_loss(reconstruction, batch)
             # TODO - make this a reparameterisation-invariant L1 penalty
             decoder_column_norms = torch.norm(model.module.decoder[0].weight, dim=0) * sparse_representation
@@ -245,25 +254,25 @@ def train(model, local_rank):
                 decoder_grad_norm = math.sqrt(torch.sum(model.module.decoder[0].weight.grad ** 2).item())
                 
                 # Log metrics only on main process
-                if local_rank == 0:
+                # if local_rank == 0:
                     # Loss metrics
-                    writer.add_scalar('Loss/step_mse', avg_step_mse, global_step)
-                    writer.add_scalar('Loss/step_l1', avg_step_l1, global_step)
-                    writer.add_scalar('Loss/step_total', avg_step_mse + args.l1_lambda * avg_step_l1, global_step)
-                    writer.add_scalar('Loss/relative_error', relative_error, global_step)
+                    # writer.add_scalar('Loss/step_mse', avg_step_mse, global_step)
+                    # writer.add_scalar('Loss/step_l1', avg_step_l1, global_step)
+                    # writer.add_scalar('Loss/step_total', avg_step_mse + args.l1_lambda * avg_step_l1, global_step)
+                    # writer.add_scalar('Loss/relative_error', relative_error.item(), global_step)
                     
                     # Parameter statistics
-                    writer.add_scalar('Parameters/weight_norm', weight_norm, global_step)
-                    writer.add_scalar('Parameters/grad_norm', grad_norm, global_step)
-                    writer.add_scalar('Parameters/encoder_norm', encoder_norm, global_step)
-                    writer.add_scalar('Parameters/decoder_norm', decoder_norm, global_step)
-                    writer.add_scalar('Parameters/encoder_grad_norm', encoder_grad_norm, global_step)
-                    writer.add_scalar('Parameters/decoder_grad_norm', decoder_grad_norm, global_step)
+                    # writer.add_scalar('Parameters/weight_norm', weight_norm, global_step)
+                    # writer.add_scalar('Parameters/grad_norm', grad_norm, global_step)
+                    # writer.add_scalar('Parameters/encoder_norm', encoder_norm, global_step)
+                    # writer.add_scalar('Parameters/decoder_norm', decoder_norm, global_step)
+                    # writer.add_scalar('Parameters/encoder_grad_norm', encoder_grad_norm, global_step)
+                    # writer.add_scalar('Parameters/decoder_grad_norm', decoder_grad_norm, global_step)
                     
                     # Activation statistics
                     # writer.add_histogram('Activations/sparse_representation', sparse_representation.flatten(), global_step)
-                    writer.add_scalar('Activations/sparsity', (sparse_representation.abs() < 1e-6).float().mean(), global_step)
-                    writer.add_scalar('Activations/max_activation', sparse_representation.abs().max(), global_step)
+                    # writer.add_scalar('Activations/sparsity', (sparse_representation.abs() < 1e-6).float().mean(), global_step)
+                    # writer.add_scalar('Activations/max_activation', sparse_representation.abs().max(), global_step)
                 
                 # Reset step accumulators
                 step_mse_loss = torch.tensor(0.0, device=local_rank)
