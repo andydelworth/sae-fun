@@ -70,7 +70,7 @@ class HDF5ActivationDataset(Dataset):
     def precompute_statistics(self):
         with h5py.File(self.hdf5_file, "r") as f:
             activations = f['activations']
-            random_idcs = np.random.choice(activations.shape[0], size=10000, replace=False)
+            random_idcs = np.random.choice(activations.shape[0], size=1000, replace=False)
             random_idcs.sort()
             self.dimwise_mean = np.mean(activations[random_idcs, :], axis=0)
 

@@ -1,4 +1,3 @@
-import gc
 import math
 from tqdm import tqdm
 import argparse
@@ -7,12 +6,10 @@ from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import os
-from sae import SAE, BatchTopKSAE
+from sae import SAE
 from activation_data import get_data_loaders
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
-from torchviz import make_dot
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--output_dir', type=str, default='sae_out/')
@@ -22,15 +19,11 @@ parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--activation_file', type=str, default='/persist/adelworth/sae-fun/token_activations_500m.h5')
 parser.add_argument('--hidden_dim_multiplier', type=int, default=64)
 parser.add_argument('--l1_lambda', type=float, default=1e-4)
-parser.add_argument('--save_every_n_steps', type=int, default=100000)
+parser.add_argument('--save_every_n_steps', type=int, default=25000)
 parser.add_argument('--validate_every_n_steps', type=int, default=25000)
 parser.add_argument('--grad_clip_norm', type=float, default=1.0)
 parser.add_argument('--resample_dead', default=False, action='store_true')
-parser.add_argument('--sae_type', type=str, default='relu')
-parser.add_argument('--init_val', action='store_true', default=True)
 args = parser.parse_args()
-
-assert args.sae_type in ('relu', 'batch_top_k')
 
 # Initialize distributed training
 def setup_ddp():
@@ -41,10 +34,7 @@ def setup_ddp():
 
 # Load model and move to GPU
 def load_model(local_rank):
-    if args.sae_type == 'relu':
-        model = SAE(input_dim=4096, hidden_dim=4096 * args.hidden_dim_multiplier).to(torch.float32)
-    elif args.sae_type == 'batch_top_k':
-        model = BatchTopKSAE(input_dim=4096, hidden_dim=4096 * args.hidden_dim_multiplier, k=16).to(torch.float32)
+    model = SAE(input_dim=4096, hidden_dim=4096 * args.hidden_dim_multiplier).to(torch.float32)
     model = model.to(local_rank)
     model = DDP(model, device_ids=[local_rank])
     if local_rank == 0:
@@ -90,6 +80,16 @@ def validate(model, validation_loader, local_rank, writer, step_num):
     
     # Gather validation metrics across all processes
     dist.all_reduce(val_mse_loss, op=dist.ReduceOp.SUM)
+                if active_indices.numel() > 0:
+                    active_features.index_fill_(0, active_indices[:, 1].unique(), True)
+            
+            val_mse_loss += mse_loss
+            val_l1_loss += decoder_invariant_l1_loss
+            val_l0_loss += l0_loss
+            total_samples += batch_size
+    
+    # Gather validation metrics across all processes
+    dist.all_reduce(val_mse_loss, op=dist.ReduceOp.SUM)
     dist.all_reduce(val_l1_loss, op=dist.ReduceOp.SUM)
     dist.all_reduce(val_l0_loss, op=dist.ReduceOp.SUM)
     dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
@@ -121,6 +121,7 @@ def validate(model, validation_loader, local_rank, writer, step_num):
 
     return avg_val_mse, avg_val_l1
 
+# TODO - make this work.
 def resample_dead_features(model, active_features, local_rank):
     if local_rank != 0:
         return
@@ -197,21 +198,9 @@ def train(model, local_rank):
         step_count = torch.tensor(0, device=local_rank)
         
         for step, tqdm_batch in enumerate(tqdm(train_loader, desc=f'Train Epoch {epoch_num}', disable=local_rank != 0)):
-
-            # if step == 100 and local_rank == 0:
-            #     make_dot(loss, params=dict(model.named_parameters())).render("loss_graph", format="pdf")
-            #     print("Graph saved to loss_graph.pdf")
             
             batch = tqdm_batch.to(torch.float32).to(local_rank)
             reconstruction, sparse_representation = model(batch)
-
-            # if (step + 1) % 1000 == 0 and local_rank == 0:
-            #     print(torch.cuda.memory_summary())
-            #     print('TENSOR COUNTS:')
-            #     print(len([obj for obj in gc.get_objects() if torch.is_tensor(obj)]))
-            #     # print('Retained Graph Refs:')
-            #     # print([t for t in gc.get_objects().shape if torch.is_tensor(t) and t.grad_fn is not None])
-            #     print(sparse_representation.shape, sparse_representation.requires_grad)
 
             mse_loss = torch.nn.functional.mse_loss(reconstruction, batch)
             # TODO - make this a reparameterisation-invariant L1 penalty
@@ -323,39 +312,3 @@ def train(model, local_rank):
             train_l1_loss += decoder_invariant_l1_loss.item()
             num_batches += 1
         
-        # Gather metrics across all processes
-        dist.all_reduce(train_mse_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(train_l1_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(num_batches, op=dist.ReduceOp.SUM)
-        
-        # Calculate averages
-        avg_train_mse = train_mse_loss.item() / num_batches.item()
-        avg_train_l1 = train_l1_loss.item() / num_batches.item()
-        
-        # Log training metrics only on main process
-        if local_rank == 0:
-            writer.add_scalar('Loss/train_mse', avg_train_mse, epoch_num)
-            writer.add_scalar('Loss/train_l1', avg_train_l1, epoch_num)
-            writer.add_scalar('Loss/train_total', avg_train_mse + args.l1_lambda * avg_train_l1, epoch_num)
-        
-        # Run validation
-        avg_val_mse, avg_val_l1 = validate(model, validation_loader, local_rank, writer, epoch_num + 1)
-        
-        # Print epoch summary only on main process
-        if local_rank == 0:
-            print(f'Epoch {epoch_num}: Train MSE: {avg_train_mse:.4f}, Train L1: {avg_train_l1:.4f}, '
-                  f'Val MSE: {avg_val_mse:.4f}, Val L1: {avg_val_l1:.4f}')
-    
-    if local_rank == 0:
-        writer.close()
-        
-        # Save the final model
-        torch.save(model.module.state_dict(), f'{run_dir}/final_model.pth')
-
-def main():
-    local_rank = setup_ddp()
-    model = load_model(local_rank)
-    train(model, local_rank)
-
-if __name__ == '__main__':
-    main()

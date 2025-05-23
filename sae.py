@@ -60,7 +60,8 @@ class BatchTopKSAE(nn.Module):
         return reconstruction, sparse_representation
     
     def update_min_act_value(self, new_val):
+        new_val = new_val.detach()
         if self.min_activation_value is None:
             self.min_activation_value = new_val
         else:
-            self.min_activation_value = self.min_activation_value * self.alpha + (1 - self.alpha) * new_val
+            self.min_activation_value = self.min_activation_value.detach() * self.alpha + (1 - self.alpha) * new_val
